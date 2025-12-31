@@ -15,6 +15,10 @@ config.hの値は私の環境向けに最適化してあるので他のGPUでは
 - MSVC (ex. Visual Studio 2022)
 - CUDA Toolkit
 
+
+1. build.batを編集しtargetアーキテクチャをお使いの環境に合わせる
+
+2. _run_
 ```powershell
 .\build.bat
 ```
