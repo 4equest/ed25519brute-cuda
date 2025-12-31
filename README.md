@@ -6,6 +6,7 @@
 GithubのcommitのVerifyに使えるVanityなSSH Key FingerprintをGPUで探索するプログラムです。  
 自分の環境ではCPUの40倍以上の速度になりますが、CPUとGPUによると思います。  
 config.hの値は私の環境向けに最適化してあるので他のGPUでは最適かどうかわかりません。  
+元ネタ: https://github.com/akiym/ed25519brute
 
 ## build
 
