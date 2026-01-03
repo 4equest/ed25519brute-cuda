@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 
 rem Target selection
 set TARGET=%1
@@ -15,10 +15,57 @@ if "%TARGET%"=="main" (
     set OUT=build\test_kernels.exe
 ) else (
     echo Unknown target: %TARGET%
-    echo Usage: build.bat [main^|test]
+    echo Usage: build.bat [main^|test] [--prefix ^<pattern^>] [--suffix ^<pattern^>]
     exit /b 1
 )
 
+rem Parse additional arguments for fixed search mode
+set FIXED_FLAGS=
+set PREFIX_ARGS=
+set SUFFIX_ARGS=
+set HAS_PREFIX=0
+set HAS_SUFFIX=0
+
+rem Skip first argument (target)
+set ARGS_STARTED=0
+for %%a in (%*) do (
+    if !ARGS_STARTED!==0 (
+        set ARGS_STARTED=1
+    ) else (
+        if "%%a"=="--prefix" (
+            set NEXT_IS_PREFIX=1
+        ) else if "%%a"=="--suffix" (
+            set NEXT_IS_SUFFIX=1
+        ) else if defined NEXT_IS_PREFIX (
+            set PREFIX_ARGS=!PREFIX_ARGS! --prefix %%a
+            set HAS_PREFIX=1
+            set NEXT_IS_PREFIX=
+        ) else if defined NEXT_IS_SUFFIX (
+            set SUFFIX_ARGS=!SUFFIX_ARGS! --suffix %%a
+            set HAS_SUFFIX=1
+            set NEXT_IS_SUFFIX=
+        )
+    )
+)
+
+rem Generate fixed conditions if prefix or suffix specified
+if !HAS_PREFIX!==1 set FIXED_FLAGS=-DFIXED_SEARCH -DFIXED_PREFIX
+if !HAS_SUFFIX!==1 (
+    if defined FIXED_FLAGS (
+        set FIXED_FLAGS=!FIXED_FLAGS! -DFIXED_SUFFIX
+    ) else (
+        set FIXED_FLAGS=-DFIXED_SEARCH -DFIXED_SUFFIX
+    )
+)
+
+if defined FIXED_FLAGS (
+    echo Generating fixed conditions...
+    python src\gen_conditions.py !PREFIX_ARGS! !SUFFIX_ARGS! -o src\fixed_conditions.cuh
+    if errorlevel 1 (
+        echo Error: Failed to generate fixed conditions
+        exit /b 1
+    )
+)
 
 rem Check if cl.exe (MSVC compiler) is already in path
 where cl.exe >nul 2>nul
@@ -50,11 +97,15 @@ call %VCVARS% >nul
 
 :build
 echo Building %TARGET% (%SRC% -^> %OUT%)...
-nvcc -O3 --use_fast_math --extra-device-vectorization -arch=sm_89 -rdc=true -lcudadevrt -t 0 --ptxas-options=-v -o %OUT% %SRC% -I src > build_log.txt 2>&1
+if defined FIXED_FLAGS (
+    echo Fixed search flags: !FIXED_FLAGS!
+)
+nvcc -O3 --use_fast_math --extra-device-vectorization -arch=sm_89 -rdc=true -lcudadevrt -t 0 --ptxas-options=-v !FIXED_FLAGS! -o %OUT% %SRC% -I src > build_log.txt 2>&1
 
 if %errorlevel% equ 0 (
     echo Build successful: %OUT%
 ) else (
     echo Build failed
+    type build_log.txt
     exit /b 1
 )

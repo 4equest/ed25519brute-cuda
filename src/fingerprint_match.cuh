@@ -329,3 +329,11 @@ __device__ __forceinline__ void hash32_to_bytes(const uint32_t* hash32, uint8_t*
         bytes[i*4+3] = (uint8_t)(hash32[i]);
     }
 }
+
+// ============================================================================
+// FIXED SEARCH MODE (Compile-time optimized conditions)
+// ============================================================================
+#ifdef FIXED_SEARCH
+#include "fixed_conditions.cuh"
+#endif
+

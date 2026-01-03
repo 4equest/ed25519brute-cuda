@@ -85,9 +85,21 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) search_kernel(
             // Compute SHA256 fingerprint (now outputs uint32_t[8])
             sha256_ssh_fingerprint(pubkeys[b], hash);
             
-            // Check match based on mode (using 32-bit functions)
+            // Check match based on mode
             bool matched = false;
             
+#ifdef FIXED_SEARCH
+            // Compile-time fixed conditions (no constant memory access)
+    #if defined(FIXED_PREFIX) && defined(FIXED_SUFFIX)
+            matched = match_prefix_fixed(hash);
+            if (matched) matched = match_suffix_fixed(hash);
+    #elif defined(FIXED_PREFIX)
+            matched = match_prefix_fixed(hash);
+    #elif defined(FIXED_SUFFIX)
+            matched = match_suffix_fixed(hash);
+    #endif
+#else
+            // Runtime dynamic matching (using constant memory)
             if (d_match_mode == 0) {
                 matched = match_prefix_32bit(hash, d_prefix_targets, d_prefix_masks,
                                              d_prefix_full_words, d_prefix_partial_mask);
@@ -102,6 +114,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) search_kernel(
                                                  d_suffix_start_word, d_suffix_word_count);
                 }
             }
+#endif
             
             if (matched) {
                 if (atomicExch(&result->found, 1) == 0) {
@@ -290,10 +303,12 @@ int main(int argc, char* argv[]) {
         }
     }
     
+#ifndef FIXED_SEARCH
     if (!prefix && !suffix) {
         print_usage(argv[0]);
         return 1;
     }
+#endif
     
 
 
@@ -351,8 +366,18 @@ int main(int argc, char* argv[]) {
 
     printf("SSH Key Fingerprint CUDA Brute Force\n");
     printf("=====================================\n");
+#ifdef FIXED_SEARCH
+    printf("Mode: Fixed search (compile-time optimized)\n");
+    #ifdef FIXED_PREFIX
+    printf("Fixed prefix: enabled\n");
+    #endif
+    #ifdef FIXED_SUFFIX
+    printf("Fixed suffix: enabled\n");
+    #endif
+#else
     if (prefix) printf("Searching for prefix: %s\n", prefix);
     if (suffix) printf("Searching for suffix: %s\n", suffix);
+#endif
     
     // Setup CUDA
     int device;
@@ -361,7 +386,8 @@ int main(int argc, char* argv[]) {
     cudaGetDeviceProperties(&prop, device);
     printf("Using GPU: %s (SM %d.%d)\n", prop.name, prop.major, prop.minor);
     
-    // Set match mode
+#ifndef FIXED_SEARCH
+    // Set match mode (only needed for runtime matching)
     int match_mode;
     if (prefix && suffix) {
         match_mode = 2;  // Both
@@ -381,6 +407,7 @@ int main(int argc, char* argv[]) {
     if (suffix) {
         setup_suffix_params(suffix);
     }
+#endif
     
     // Allocate result buffers - double buffering
     // Using NUM_STREAMS from config.h
