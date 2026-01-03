@@ -29,22 +29,20 @@ struct MatchResult {
     int found;                  // Match flag
 };
 
-// Device-side PREFIX match parameters
-__constant__ uint8_t d_prefix_bytes[32];
-__constant__ int d_prefix_full_bytes;
-__constant__ int d_prefix_partial_bits;
-
-__constant__ uint8_t d_prefix_partial_mask;
-__constant__ uint8_t d_prefix_partial_value;
+// Device-side PREFIX match parameters (32-bit optimized)
+__constant__ uint32_t d_prefix_targets[8];
+__constant__ uint32_t d_prefix_masks[8];
+__constant__ int d_prefix_full_words;
+__constant__ uint32_t d_prefix_partial_mask;
 
 // Base seed for deterministic search (randomized at start)
 __constant__ uint8_t d_base_seed[32];
 
-// Device-side SUFFIX match parameters (NEW Uniform Masking)
-__constant__ int d_suffix_start_offset;
-__constant__ int d_suffix_len;
-__constant__ uint8_t d_suffix_targets[32];
-__constant__ uint8_t d_suffix_masks[32];
+// Device-side SUFFIX match parameters (32-bit optimized)
+__constant__ uint32_t d_suffix_targets[8];
+__constant__ uint32_t d_suffix_masks[8];
+__constant__ int d_suffix_start_word;
+__constant__ int d_suffix_word_count;
 
 __constant__ int d_match_mode;  // 0=prefix only, 1=suffix only, 2=both
 
@@ -61,7 +59,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) search_kernel(
     // Batch processing - BATCH_SIZE keys at a time
     uint8_t seeds[BATCH_SIZE][32];
     uint8_t pubkeys[BATCH_SIZE][32];
-    uint8_t hash[32];
+    uint32_t hash[8];  // 32-bit hash for optimized matching
     
     // Process ITERATIONS_PER_THREAD keys in batches
     for (int iter = 0; iter < ITERATIONS_PER_THREAD; iter += BATCH_SIZE) {
@@ -84,28 +82,24 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) search_kernel(
         // Check each key for match
         #pragma unroll
         for (int b = 0; b < BATCH_SIZE; b++) {
-            // Compute SHA256 fingerprint
+            // Compute SHA256 fingerprint (now outputs uint32_t[8])
             sha256_ssh_fingerprint(pubkeys[b], hash);
             
-            // Check match based on mode
+            // Check match based on mode (using 32-bit functions)
             bool matched = false;
             
             if (d_match_mode == 0) {
-                matched = match_prefix(hash, d_prefix_bytes, d_prefix_full_bytes,
-                                       d_prefix_partial_bits, d_prefix_partial_mask,
-                                       d_prefix_partial_value);
+                matched = match_prefix_32bit(hash, d_prefix_targets, d_prefix_masks,
+                                             d_prefix_full_words, d_prefix_partial_mask);
             } else if (d_match_mode == 1) {
-                matched = match_suffix_uniform(hash, 
-                                               d_suffix_start_offset, d_suffix_len,
-                                               d_suffix_targets, d_suffix_masks);
+                matched = match_suffix_32bit(hash, d_suffix_targets, d_suffix_masks,
+                                             d_suffix_start_word, d_suffix_word_count);
             } else {
-                matched = match_prefix(hash, d_prefix_bytes, d_prefix_full_bytes,
-                                       d_prefix_partial_bits, d_prefix_partial_mask,
-                                       d_prefix_partial_value);
+                matched = match_prefix_32bit(hash, d_prefix_targets, d_prefix_masks,
+                                             d_prefix_full_words, d_prefix_partial_mask);
                 if (matched) {
-                    matched = match_suffix_uniform(hash, 
-                                                   d_suffix_start_offset, d_suffix_len,
-                                                   d_suffix_targets, d_suffix_masks);
+                    matched = match_suffix_32bit(hash, d_suffix_targets, d_suffix_masks,
+                                                 d_suffix_start_word, d_suffix_word_count);
                 }
             }
             
@@ -113,7 +107,8 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) search_kernel(
                 if (atomicExch(&result->found, 1) == 0) {
                     memcpy(result->seed, seeds[b], 32);
                     memcpy(result->public_key, pubkeys[b], 32);
-                    memcpy(result->fingerprint, hash, 32);
+                    // Convert uint32_t hash to bytes for output
+                    hash32_to_bytes(hash, result->fingerprint);
                     memcpy(result->private_key, seeds[b], 32);
                     memcpy(result->private_key + 32, pubkeys[b], 32);
                 }
@@ -123,36 +118,38 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK, 2) search_kernel(
     }
 }
 
-// Host function to setup prefix matching parameters
+// Host function to setup prefix matching parameters (32-bit optimized)
 void setup_prefix_params(const char* prefix) {
-    uint8_t prefix_bytes[32] = {0};
-    int full_bytes, partial_bits;
-    uint8_t partial_mask, partial_value;
+    uint32_t targets[8] = {0};
+    uint32_t masks[8] = {0};
+    int full_words, partial_bits;
     
-    decode_prefix_pattern(prefix, prefix_bytes, &full_bytes, &partial_bits,
-                          &partial_mask, &partial_value);
+    decode_prefix_pattern_32bit(prefix, targets, masks, &full_words, &partial_bits);
     
-    cudaMemcpyToSymbol(d_prefix_bytes, prefix_bytes, 32);
-    cudaMemcpyToSymbol(d_prefix_full_bytes, &full_bytes, sizeof(int));
-    cudaMemcpyToSymbol(d_prefix_partial_bits, &partial_bits, sizeof(int));
-    cudaMemcpyToSymbol(d_prefix_partial_mask, &partial_mask, sizeof(uint8_t));
-    cudaMemcpyToSymbol(d_prefix_partial_value, &partial_value, sizeof(uint8_t));
+    // Calculate partial mask for the word containing the partial bits
+    uint32_t partial_mask = 0;
+    if (partial_bits > 0) {
+        partial_mask = masks[full_words];
+    }
+    
+    cudaMemcpyToSymbol(d_prefix_targets, targets, sizeof(uint32_t) * 8);
+    cudaMemcpyToSymbol(d_prefix_masks, masks, sizeof(uint32_t) * 8);
+    cudaMemcpyToSymbol(d_prefix_full_words, &full_words, sizeof(int));
+    cudaMemcpyToSymbol(d_prefix_partial_mask, &partial_mask, sizeof(uint32_t));
 }
 
-// Helper to setup suffix params
+// Helper to setup suffix params (32-bit optimized)
 void setup_suffix_params(const char* suffix) {
-    int start_offset, match_len;
-    uint8_t targets[32] = {0};
-    uint8_t masks[32] = {0};
+    uint32_t targets[8] = {0};
+    uint32_t masks[8] = {0};
+    int start_word, word_count;
     
-    decode_suffix_pattern_uniform(suffix, 
-                                  &start_offset, &match_len,
-                                  targets, masks);
+    decode_suffix_pattern_32bit(suffix, targets, masks, &start_word, &word_count);
     
-    cudaMemcpyToSymbol(d_suffix_start_offset, &start_offset, sizeof(int));
-    cudaMemcpyToSymbol(d_suffix_len, &match_len, sizeof(int));
-    cudaMemcpyToSymbol(d_suffix_targets, targets, 32);
-    cudaMemcpyToSymbol(d_suffix_masks, masks, 32);
+    cudaMemcpyToSymbol(d_suffix_targets, targets, sizeof(uint32_t) * 8);
+    cudaMemcpyToSymbol(d_suffix_masks, masks, sizeof(uint32_t) * 8);
+    cudaMemcpyToSymbol(d_suffix_start_word, &start_word, sizeof(int));
+    cudaMemcpyToSymbol(d_suffix_word_count, &word_count, sizeof(int));
 }
 
 void print_usage(const char* prog) {
@@ -241,6 +238,15 @@ bool is_valid_base64(const char* str) {
     return true;
 }
 
+bool file_exists(const char* filename) {
+    FILE* f = fopen(filename, "r");
+    if (f) {
+        fclose(f);
+        return true;
+    }
+    return false;
+}
+
 int main(int argc, char* argv[]) {
     // Initialize secure RNG
     // On Windows (MSVC), std::random_device calls RtlGenRandom (SystemFunction036)
@@ -319,6 +325,30 @@ int main(int argc, char* argv[]) {
         }
     }
     
+    // Check for existing key files and prompt for overwrite
+    const char* output_files[] = {"found_key.txt", "id_ed25519", "id_ed25519.pub"};
+    bool any_exists = false;
+    for (int i = 0; i < 3; i++) {
+        if (file_exists(output_files[i])) {
+            if (!any_exists) {
+                printf("Warning: The following key files already exist:\n");
+                any_exists = true;
+            }
+            printf("  - %s\n", output_files[i]);
+        }
+    }
+    if (any_exists) {
+        printf("Do you want to overwrite them? (y/n): ");
+        fflush(stdout);
+        int c = getchar();
+        // Clear remaining input
+        while (getchar() != '\n' && !feof(stdin));
+        if (c != 'y' && c != 'Y') {
+            printf("Aborted.\n");
+            return 0;
+        }
+    }
+
     printf("SSH Key Fingerprint CUDA Brute Force\n");
     printf("=====================================\n");
     if (prefix) printf("Searching for prefix: %s\n", prefix);

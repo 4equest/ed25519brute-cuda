@@ -93,6 +93,46 @@ __global__ void test_suffix_match_kernel(const uint8_t* hash, int* result) {
                                    d_test_suffix_targets, d_test_suffix_masks);
 }
 
+// ============================================================================
+// 32-BIT MATCHING TESTS (Direct tests for new optimized functions)
+// ============================================================================
+
+// Device-side 32-bit PREFIX match parameters 
+__constant__ uint32_t d_test_prefix32_targets[8];
+__constant__ uint32_t d_test_prefix32_masks[8];
+__constant__ int d_test_prefix32_full_words;
+__constant__ uint32_t d_test_prefix32_partial_mask;
+
+// Device-side 32-bit SUFFIX match parameters
+__constant__ uint32_t d_test_suffix32_targets[8];
+__constant__ uint32_t d_test_suffix32_masks[8];
+__constant__ int d_test_suffix32_start_word;
+__constant__ int d_test_suffix32_word_count;
+
+// Test kernel for 32-bit prefix matching
+__global__ void test_prefix_match_32bit_kernel(const uint32_t* hash, int* result) {
+    *result = match_prefix_32bit(hash, d_test_prefix32_targets, d_test_prefix32_masks,
+                                 d_test_prefix32_full_words, d_test_prefix32_partial_mask);
+}
+
+// Test kernel for 32-bit suffix matching
+__global__ void test_suffix_match_32bit_kernel(const uint32_t* hash, int* result) {
+    *result = match_suffix_32bit(hash, d_test_suffix32_targets, d_test_suffix32_masks,
+                                 d_test_suffix32_start_word, d_test_suffix32_word_count);
+}
+
+// Test kernel: SHA256 -> 32-bit matching (full integration)
+__global__ void test_sha256_with_32bit_match_kernel(const uint8_t* pubkey, 
+                                                     const uint32_t* expected_targets,
+                                                     const uint32_t* expected_masks,
+                                                     int full_words,
+                                                     uint32_t partial_mask,
+                                                     int* result) {
+    uint32_t hash[8];
+    sha256_ssh_fingerprint(pubkey, hash);
+    *result = match_prefix_32bit(hash, expected_targets, expected_masks, full_words, partial_mask);
+}
+
 // CUDA kernels
 __global__ void test_sha512_kernel(const uint8_t* seed, uint8_t* output) {
     sha512_32bytes(seed, output);
@@ -119,19 +159,22 @@ __global__ void test_ed25519_keypair_kernel(const uint8_t* seed, uint8_t* privat
 // Full pipeline: seed -> public key -> fingerprint hash
 __global__ void test_full_pipeline_kernel(const uint8_t* seed, uint8_t* pubkey, uint8_t* fp_hash) {
     uint8_t l_pub[32];
-    uint8_t l_hash[32];
+    uint32_t l_hash32[8];
     
     ed25519_pubkey_from_seed(seed, l_pub);
-    sha256_ssh_fingerprint(l_pub, l_hash);
+    sha256_ssh_fingerprint(l_pub, l_hash32);
     
     if (threadIdx.x == 0) {
         for(int i=0; i<32; i++) pubkey[i] = l_pub[i];
-        for(int i=0; i<32; i++) fp_hash[i] = l_hash[i];
+        // Convert uint32_t hash to bytes for verification
+        hash32_to_bytes(l_hash32, fp_hash);
     }
 }
 
 __global__ void test_only_sha256_kernel(const uint8_t* pubkey, uint8_t* hash) {
-    sha256_ssh_fingerprint(pubkey, hash);
+    uint32_t hash32[8];
+    sha256_ssh_fingerprint(pubkey, hash32);
+    hash32_to_bytes(hash32, hash);
 }
 
 #define TEST_BATCH_SIZE 32
@@ -684,6 +727,225 @@ void run_batch_inversion_tests(TestVector* v, uint32_t n, TestResults* r) {
     cudaFree(d_single);
 }
 
+// ============================================================================
+// 32-BIT MATCHING TESTS
+// ============================================================================
+void run_32bit_matching_tests(TestResults* r) {
+    printf("\n=== 32-bit Optimized Matching Tests ===\n");
+    
+    uint32_t *d_hash32;
+    int *d_result;
+    int h_result;
+    cudaMalloc(&d_hash32, sizeof(uint32_t) * 8);
+    cudaMalloc(&d_result, sizeof(int));
+    
+    int pass = 0, fail = 0;
+    
+    // Test 1: Simple prefix match - pattern "AA" covers 12 bits (first word, partial)
+    printf("\n[32-bit Prefix Tests]\n");
+    {
+        // "AA" in Base64 = 0b 000000 000000 = first 12 bits are 0
+        // This means hash[0] should have top 12 bits = 0
+        uint32_t targets[8] = {0};
+        uint32_t masks[8] = {0};
+        int full_words, partial_bits;
+        decode_prefix_pattern_32bit("AA", targets, masks, &full_words, &partial_bits);
+        
+        cudaMemcpyToSymbol(d_test_prefix32_targets, targets, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_prefix32_masks, masks, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_prefix32_full_words, &full_words, sizeof(int));
+        uint32_t partial_mask = (partial_bits > 0) ? masks[full_words] : 0;
+        cudaMemcpyToSymbol(d_test_prefix32_partial_mask, &partial_mask, sizeof(uint32_t));
+        
+        // Test: hash with first 12 bits = 0 should match
+        uint32_t h_hash[8] = {0x000FFFFF, 0x12345678, 0x9ABCDEF0, 0x11111111,
+                              0x22222222, 0x33333333, 0x44444444, 0x55555555};
+        cudaMemcpy(d_hash32, h_hash, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+        test_prefix_match_32bit_kernel<<<1, 1>>>(d_hash32, d_result);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+        
+        r->total++;
+        if (h_result) {
+            printf("[PASS] Prefix 'AA' matches hash with top 12 bits = 0\n");
+            r->passed++; pass++;
+        } else {
+            printf("[FAIL] Prefix 'AA' did NOT match (full_words=%d, partial_bits=%d, mask=0x%08X)\n", 
+                   full_words, partial_bits, partial_mask);
+            r->failed++; fail++;
+        }
+        
+        // Negative test: hash with first bit = 1 should NOT match
+        h_hash[0] = 0x80000000; // MSB = 1
+        cudaMemcpy(d_hash32, h_hash, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+        test_prefix_match_32bit_kernel<<<1, 1>>>(d_hash32, d_result);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+        
+        r->total++;
+        if (!h_result) {
+            printf("[PASS] Prefix 'AA' does NOT match hash with MSB=1\n");
+            r->passed++; pass++;
+        } else {
+            printf("[FAIL] Prefix 'AA' INCORRECTLY matched hash with MSB=1\n");
+            r->failed++; fail++;
+        }
+    }
+    
+    // Test 2: Multi-word prefix - pattern "AAAAAAAA" covers 48 bits (1 full word + 16 bits)
+    {
+        uint32_t targets[8] = {0};
+        uint32_t masks[8] = {0};
+        int full_words, partial_bits;
+        decode_prefix_pattern_32bit("AAAAAAAA", targets, masks, &full_words, &partial_bits);
+        
+        cudaMemcpyToSymbol(d_test_prefix32_targets, targets, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_prefix32_masks, masks, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_prefix32_full_words, &full_words, sizeof(int));
+        uint32_t partial_mask = (partial_bits > 0) ? masks[full_words] : 0;
+        cudaMemcpyToSymbol(d_test_prefix32_partial_mask, &partial_mask, sizeof(uint32_t));
+        
+        // Test: hash with first 48 bits = 0 should match
+        uint32_t h_hash[8] = {0x00000000, 0x0000FFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                              0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF};
+        cudaMemcpy(d_hash32, h_hash, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+        test_prefix_match_32bit_kernel<<<1, 1>>>(d_hash32, d_result);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+        
+        r->total++;
+        if (h_result) {
+            printf("[PASS] Long prefix 'AAAAAAAA' (48 bits) matches correctly\n");
+            r->passed++; pass++;
+        } else {
+            printf("[FAIL] Long prefix 'AAAAAAAA' did NOT match (full_words=%d, partial=%d)\n",
+                   full_words, partial_bits);
+            r->failed++; fail++;
+        }
+    }
+    
+    // Test 3: Suffix matching 32-bit
+    printf("\n[32-bit Suffix Tests]\n");
+    {
+        // Suffix "A" means last 4 bits of hash (bits 252-255) should be 0000
+        uint32_t targets[8] = {0};
+        uint32_t masks[8] = {0};
+        int start_word, word_count;
+        decode_suffix_pattern_32bit("A", targets, masks, &start_word, &word_count);
+        
+        cudaMemcpyToSymbol(d_test_suffix32_targets, targets, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_suffix32_masks, masks, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_suffix32_start_word, &start_word, sizeof(int));
+        cudaMemcpyToSymbol(d_test_suffix32_word_count, &word_count, sizeof(int));
+        
+        // Hash ending in 0x...0 should match
+        uint32_t h_hash[8] = {0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF,
+                              0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFF0};
+        cudaMemcpy(d_hash32, h_hash, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+        test_suffix_match_32bit_kernel<<<1, 1>>>(d_hash32, d_result);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+        
+        r->total++;
+        if (h_result) {
+            printf("[PASS] Suffix 'A' matches hash ending in ...0\n");
+            r->passed++; pass++;
+        } else {
+            printf("[FAIL] Suffix 'A' did NOT match (start_word=%d, word_count=%d)\n",
+                   start_word, word_count);
+            r->failed++; fail++;
+        }
+        
+        // Negative test
+        h_hash[7] = 0xFFFFFFF1; // LSB nibble = 1
+        cudaMemcpy(d_hash32, h_hash, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+        test_suffix_match_32bit_kernel<<<1, 1>>>(d_hash32, d_result);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+        
+        r->total++;
+        if (!h_result) {
+            printf("[PASS] Suffix 'A' does NOT match hash ending in ...1\n");
+            r->passed++; pass++;
+        } else {
+            printf("[FAIL] Suffix 'A' INCORRECTLY matched hash ending in ...1\n");
+            r->failed++; fail++;
+        }
+    }
+    
+    // Test 4: Verify byte<->uint32 conversion consistency
+    printf("\n[Byte <-> uint32 Conversion Consistency Tests]\n");
+    {
+        // Take a known SHA256 pubkey output and verify conversion
+        uint8_t test_pubkey[32] = {0};
+        for (int i = 0; i < 32; i++) test_pubkey[i] = (uint8_t)(i * 7 + 13);
+        
+        uint8_t *d_pubkey;
+        uint8_t *d_hash_bytes;
+        uint8_t h_hash_bytes[32];
+        
+        cudaMalloc(&d_pubkey, 32);
+        cudaMalloc(&d_hash_bytes, 32);
+        cudaMemcpy(d_pubkey, test_pubkey, 32, cudaMemcpyHostToDevice);
+        
+        // Get hash as bytes via test_only_sha256_kernel
+        test_only_sha256_kernel<<<1, 1>>>(d_pubkey, d_hash_bytes);
+        cudaDeviceSynchronize();
+        cudaMemcpy(h_hash_bytes, d_hash_bytes, 32, cudaMemcpyDeviceToHost);
+        
+        // Now manually pack bytes to uint32 and compare
+        uint32_t expected_uint32[8];
+        for (int i = 0; i < 8; i++) {
+            expected_uint32[i] = ((uint32_t)h_hash_bytes[i*4] << 24) |
+                                 ((uint32_t)h_hash_bytes[i*4+1] << 16) |
+                                 ((uint32_t)h_hash_bytes[i*4+2] << 8) |
+                                 h_hash_bytes[i*4+3];
+        }
+        
+        // Create prefix pattern from known hash (first 2 bytes)
+        char prefix_from_hash[5];
+        const char* b64_table = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        prefix_from_hash[0] = b64_table[(h_hash_bytes[0] >> 2) & 0x3F];
+        prefix_from_hash[1] = b64_table[((h_hash_bytes[0] & 0x03) << 4) | ((h_hash_bytes[1] >> 4) & 0x0F)];
+        prefix_from_hash[2] = '\0';
+        
+        // Decode this prefix to 32-bit format
+        uint32_t targets[8] = {0};
+        uint32_t masks[8] = {0};
+        int full_words, partial_bits;
+        decode_prefix_pattern_32bit(prefix_from_hash, targets, masks, &full_words, &partial_bits);
+        
+        // The hash should match its own prefix!
+        cudaMemcpyToSymbol(d_test_prefix32_targets, targets, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_prefix32_masks, masks, sizeof(uint32_t) * 8);
+        cudaMemcpyToSymbol(d_test_prefix32_full_words, &full_words, sizeof(int));
+        uint32_t partial_mask = (partial_bits > 0) ? masks[full_words] : 0;
+        cudaMemcpyToSymbol(d_test_prefix32_partial_mask, &partial_mask, sizeof(uint32_t));
+        
+        cudaMemcpy(d_hash32, expected_uint32, sizeof(uint32_t) * 8, cudaMemcpyHostToDevice);
+        test_prefix_match_32bit_kernel<<<1, 1>>>(d_hash32, d_result);
+        cudaDeviceSynchronize();
+        cudaMemcpy(&h_result, d_result, sizeof(int), cudaMemcpyDeviceToHost);
+        
+        r->total++;
+        if (h_result) {
+            printf("[PASS] Hash matches its own 2-char prefix '%s'\n", prefix_from_hash);
+            r->passed++; pass++;
+        } else {
+            printf("[FAIL] Hash did NOT match its own prefix '%s'\n", prefix_from_hash);
+            r->failed++; fail++;
+        }
+        
+        cudaFree(d_pubkey);
+        cudaFree(d_hash_bytes);
+    }
+    
+    printf("\n32-bit Matching: %d/%d passed\n", pass, pass + fail);
+    
+    cudaFree(d_hash32);
+    cudaFree(d_result);
+}
+
 int main() {
     log_file = fopen("test_log.txt", "w");
     cudaDeviceSetLimit(cudaLimitPrintfFifoSize, 1024 * 1024 * 64); // Increase printf buffer
@@ -735,6 +997,7 @@ int main() {
     run_ed25519_keypair_tests(vectors, count, &results);
     run_full_pipeline_tests(vectors, count, &results);
     run_matching_tests(&results);
+    run_32bit_matching_tests(&results);  // NEW: Test 32-bit optimized matching
     
     // New Isolated SHA-256 Tests
     uint32_t sha256_count;

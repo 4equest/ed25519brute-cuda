@@ -57,7 +57,7 @@ __device__ __forceinline__ uint32_t sha256_gamma1(uint32_t x) {
 //   73 73 68 2d 65 64 32 35 35 31 39  ("ssh-ed25519")
 //   00 00 00 20  (length of public key = 32)
 //   [32 bytes public key]
-__device__ void sha256_ssh_fingerprint(const uint8_t* pubkey, uint8_t* hash) {
+__device__ void sha256_ssh_fingerprint(const uint8_t* pubkey, uint32_t* hash) {
     // Build message directly in w[] array
     // Total: 51 bytes message + 1 byte 0x80 + padding + 8 bytes length = 64 bytes (1 block)
     uint32_t w[64];
@@ -142,18 +142,13 @@ __device__ void sha256_ssh_fingerprint(const uint8_t* pubkey, uint8_t* hash) {
         d = c; c = b; b = a; a = t1 + t2;
     }
     
-    // Add precomputed initial state (after rounds 0-3 were applied to IV)
-    // Final state = IV + (compression result)
-    a += 0x6a09e667; b += 0xbb67ae85; c += 0x3c6ef372; d += 0xa54ff53a;
-    e += 0x510e527f; f += 0x9b05688c; g += 0x1f83d9ab; h += 0x5be0cd19;
-    
-    // Output as big-endian bytes
-    hash[0]  = (uint8_t)(a >> 24); hash[1]  = (uint8_t)(a >> 16); hash[2]  = (uint8_t)(a >> 8); hash[3]  = (uint8_t)a;
-    hash[4]  = (uint8_t)(b >> 24); hash[5]  = (uint8_t)(b >> 16); hash[6]  = (uint8_t)(b >> 8); hash[7]  = (uint8_t)b;
-    hash[8]  = (uint8_t)(c >> 24); hash[9]  = (uint8_t)(c >> 16); hash[10] = (uint8_t)(c >> 8); hash[11] = (uint8_t)c;
-    hash[12] = (uint8_t)(d >> 24); hash[13] = (uint8_t)(d >> 16); hash[14] = (uint8_t)(d >> 8); hash[15] = (uint8_t)d;
-    hash[16] = (uint8_t)(e >> 24); hash[17] = (uint8_t)(e >> 16); hash[18] = (uint8_t)(e >> 8); hash[19] = (uint8_t)e;
-    hash[20] = (uint8_t)(f >> 24); hash[21] = (uint8_t)(f >> 16); hash[22] = (uint8_t)(f >> 8); hash[23] = (uint8_t)f;
-    hash[24] = (uint8_t)(g >> 24); hash[25] = (uint8_t)(g >> 16); hash[26] = (uint8_t)(g >> 8); hash[27] = (uint8_t)g;
-    hash[28] = (uint8_t)(h >> 24); hash[29] = (uint8_t)(h >> 16); hash[30] = (uint8_t)(h >> 8); hash[31] = (uint8_t)h;
+    // Output directly as uint32_t (no byte conversion for matching)
+    hash[0] = a + 0x6a09e667;
+    hash[1] = b + 0xbb67ae85;
+    hash[2] = c + 0x3c6ef372;
+    hash[3] = d + 0xa54ff53a;
+    hash[4] = e + 0x510e527f;
+    hash[5] = f + 0x9b05688c;
+    hash[6] = g + 0x1f83d9ab;
+    hash[7] = h + 0x5be0cd19;
 }
